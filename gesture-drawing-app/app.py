@@ -1,7 +1,7 @@
 import cv2
 import streamlit as st
 import numpy as np
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from streamlit_webrtc import webrtc_streamer, RTCConfiguration
 import av
 import time
 import threading
@@ -11,11 +11,31 @@ from utils.drawing_utils import create_canvas, draw_line_with_glow, blend_canvas
 
 st.set_page_config(page_title="AI Air Drawing App", page_icon="✏️", layout="wide")
 
-# Setup session state for global variables
-if 'canvas' not in st.session_state:
-    st.session_state['canvas'] = None
+# Setup session state for UI signals
 if 'clear_canvas' not in st.session_state:
     st.session_state['clear_canvas'] = False
+
+# --- Global Thread-Safe State for WebRTC ---
+class DrawingState:
+    def __init__(self):
+        self.tracker = HandTracker(min_detection_confidence=0.8)
+        self.canvas = None
+        self.px = 0
+        self.py = 0
+        self.prev_time = 0
+        self.lock = threading.Lock()
+
+        # UI synced properties
+        self.draw_color = (0, 0, 255)
+        self.brush_thickness = 5
+        self.glow_effect = True
+        self.clear_requested = False
+
+@st.cache_resource
+def get_drawing_state():
+    return DrawingState()
+
+state = get_drawing_state()
 
 # --- UI Sidebar ---
 st.sidebar.title("🎨 Drawing Controls")
@@ -41,6 +61,15 @@ glow_effect = st.sidebar.checkbox("Neon Glow Effect", value=True)
 if st.sidebar.button("Clear Canvas"):
     st.session_state['clear_canvas'] = True
 
+# Update background state from UI
+with state.lock:
+    state.draw_color = draw_color
+    state.brush_thickness = brush_thickness
+    state.glow_effect = glow_effect
+    if st.session_state['clear_canvas']:
+        state.clear_requested = True
+        st.session_state['clear_canvas'] = False
+
 # Instructions
 st.sidebar.markdown("### 🖐️ Gesture Guide:")
 st.sidebar.markdown("- ☝️ **Index finger only**: Draw")
@@ -50,54 +79,44 @@ st.sidebar.markdown("- ✋ **Open Hand (all fingers)**: Clear Canvas")
 st.title("AI Air Drawing App")
 st.write("Draw in the air using your webcam and hand gestures!")
 
-class VideoProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.tracker = HandTracker(min_detection_confidence=0.8)
-        self.px, self.py = 0, 0
-        self.canvas = None
-        self.prev_time = 0
-        self.draw_color = (0, 0, 255)
-        self.brush_thickness = 5
-        self.glow_effect = True
-        self.clear_canvas = False
-        self.lock = threading.Lock()
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    img = frame.to_ndarray(format="bgr24")
+    img = cv2.flip(img, 1) # Mirror image
+    h, w, c = img.shape
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1) # Mirror image
-        h, w, c = img.shape
+    timestamp_ms = int(frame.time * 1000)
 
-        with self.lock:
-            # Initialize canvas if needed
-            if self.canvas is None or self.canvas.shape[:2] != (h, w):
-                self.canvas = create_canvas(h, w)
+    with state.lock:
+        # Initialize canvas if needed
+        if state.canvas is None or state.canvas.shape[:2] != (h, w):
+            state.canvas = create_canvas(h, w)
 
-            # Check if clear was requested from UI
-            if self.clear_canvas:
-                self.canvas = create_canvas(h, w)
-                self.clear_canvas = False
+        # Check if clear was requested from UI
+        if state.clear_requested:
+            state.canvas = create_canvas(h, w)
+            state.clear_requested = False
 
-            color = self.draw_color
-            thickness = self.brush_thickness
-            neon = self.glow_effect
+        color = state.draw_color
+        thickness = state.brush_thickness
+        neon = state.glow_effect
 
-        # Find hands
-        img = self.tracker.find_hands(img)
-        lm_list, fingers = self.tracker.get_finger_states(img)
+    # Find hands
+    img = state.tracker.find_hands(img, timestamp_ms=timestamp_ms)
+    lm_list, fingers = state.tracker.get_finger_states(img)
 
+    with state.lock:
         if len(lm_list) != 0:
             x1, y1 = lm_list[8][1:] # Index finger tip
             x2, y2 = lm_list[12][1:] # Middle finger tip
 
             # Gesture: Open Hand -> Clear
             if sum(fingers) == 5:
-                with self.lock:
-                    self.canvas = create_canvas(h, w)
+                state.canvas = create_canvas(h, w)
                 cv2.putText(img, "Canvas Cleared!", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
             # Gesture: Index + Middle -> Move/Hover
             elif fingers[1] and fingers[2] and not fingers[3] and not fingers[4]:
-                self.px, self.py = 0, 0 # Reset points so it doesn't connect
+                state.px, state.py = 0, 0 # Reset points so it doesn't connect
                 cv2.circle(img, (x1, y1), 15, color, cv2.FILLED)
                 cv2.putText(img, "Hover Mode", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
@@ -105,66 +124,52 @@ class VideoProcessor(VideoProcessorBase):
             elif fingers[1] and not fingers[2]:
                 cv2.circle(img, (x1, y1), 15, color, cv2.FILLED)
                 cv2.putText(img, "Drawing Mode", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-                if self.px == 0 and self.py == 0:
-                    self.px, self.py = x1, y1
+                if state.px == 0 and state.py == 0:
+                    state.px, state.py = x1, y1
 
                 # Draw on canvas
-                with self.lock:
-                    self.canvas = draw_line_with_glow(
-                        self.canvas,
-                        (self.px, self.py),
-                        (x1, y1),
-                        color,
-                        thickness=thickness,
-                        glow_thickness=thickness * 3,
-                        is_neon=neon
-                    )
-                self.px, self.py = x1, y1
+                state.canvas = draw_line_with_glow(
+                    state.canvas,
+                    (state.px, state.py),
+                    (x1, y1),
+                    color,
+                    thickness=thickness,
+                    glow_thickness=thickness * 3,
+                    is_neon=neon
+                )
+                state.px, state.py = x1, y1
             else:
-                 self.px, self.py = 0, 0
+                 state.px, state.py = 0, 0
         else:
-            self.px, self.py = 0, 0
+            state.px, state.py = 0, 0
 
         # Blend canvas with frame
-        with self.lock:
-            if self.canvas is not None:
-                img = blend_canvas(img, self.canvas)
+        if state.canvas is not None:
+            img = blend_canvas(img, state.canvas)
 
-        # FPS Counter
-        curr_time = time.time()
-        fps = 1 / (curr_time - self.prev_time) if (curr_time - self.prev_time) > 0 else 0
-        self.prev_time = curr_time
-        cv2.putText(img, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    # FPS Counter
+    curr_time = time.time()
+    fps = 1 / (curr_time - state.prev_time) if (curr_time - state.prev_time) > 0 else 0
+    state.prev_time = curr_time
+    cv2.putText(img, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 rtc_configuration = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-ctx = webrtc_streamer(
+webrtc_streamer(
     key="drawing-app",
-    video_processor_factory=VideoProcessor,
+    video_frame_callback=video_frame_callback,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={"video": True, "audio": False},
 )
 
-if ctx.video_processor:
-    ctx.video_processor.draw_color = draw_color
-    ctx.video_processor.brush_thickness = brush_thickness
-    ctx.video_processor.glow_effect = glow_effect
-    if st.session_state['clear_canvas']:
-        ctx.video_processor.clear_canvas = True
-        st.session_state['clear_canvas'] = False
-
-# To allow downloading, we need a snapshot of the canvas from the video processor.
-# Note: Streamlit WebRTC isolates frames, so getting a clean download requires
-# extracting it via a button click that grabs the current canvas property.
-
-if ctx.video_processor and ctx.video_processor.canvas is not None:
-    # Use a lock-safe copy if available
-    with ctx.video_processor.lock:
-        current_canvas = ctx.video_processor.canvas.copy()
+# To allow downloading
+if state.canvas is not None:
+    with state.lock:
+        current_canvas = state.canvas.copy()
 
     is_success, buffer = cv2.imencode(".png", current_canvas)
     if is_success:
